@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .db import TelemetryRow
+from .features import extract_features
+from .nasa_baseline import get_baseline
+from .nasa_rul import estimate_rul_seconds, model_active as nasa_rul_active
+import os
+import time
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+# NASA IMS Bearings baseline uses a different vibration unit/scale than our Arduino "vibrationIntensity".
+# Use a calibration multiplier to bring device values into the same rough range for z-score comparison.
+# Example (typical device vibration ~327, baseline mean ~0.15): DT_NASA_VIBRATION_SCALE=0.00046
+_NASA_VIBRATION_SCALE = _env_float("DT_NASA_VIBRATION_SCALE", 1.0)
+_NASA_RUL_WARN_SECONDS = _env_float("DT_NASA_RUL_WARN_SECONDS", 3600.0)
+_NASA_RUL_CRIT_SECONDS = _env_float("DT_NASA_RUL_CRIT_SECONDS", 600.0)
+_NASA_RUL_AFFECTS_SCORE = _env_float("DT_NASA_RUL_AFFECTS_SCORE", 1.0)
+_NASA_BASELINE_WARN_Z = _env_float("DT_NASA_BASELINE_WARN_Z", 5.0)
+_NASA_BASELINE_CRIT_Z = _env_float("DT_NASA_BASELINE_CRIT_Z", 8.0)
+_NASA_VIBRATION_EMA_ALPHA = _env_float("DT_NASA_VIBRATION_EMA_ALPHA", 0.2)
+_NASA_TRANSIENT_SECONDS = _env_float("DT_NASA_TRANSIENT_SECONDS", 2.0)
+_NASA_BASELINE_CONFIRM_SAMPLES = int(_env_float("DT_NASA_BASELINE_CONFIRM_SAMPLES", 3.0))
+
+# Module-level EMA state for smoothing noisy vibration before NASA comparisons.
+# This reduces false WARNING/CRITICAL due to single-sample spikes from the MPU6050-derived metric.
+_vib_ema_raw: float | None = None
+
+# After PWM changes, the derived vibration metric can spike transiently.
+# We ignore NASA baseline/RUL scoring for a short period after PWM changes to avoid flicker.
+_last_pwm: int | None = None
+_last_pwm_change_t: float | None = None
+_baseline_warn_streak: int = 0
+_baseline_crit_streak: int = 0
+
+
+@dataclass(frozen=True)
+class Risk:
+    score: float  # 0..1
+    level: str  # normal|warning|critical
+    health: int  # 0..100
+    reasons: list[str]
+    eta_seconds: float | None
+    eta_label: str | None
+    recommendations: list[str]
+    baseline_z_max: float | None
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+def _dedup(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        if it not in seen:
+            out.append(it)
+            seen.add(it)
+    return out
+
+def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
+    """
+    Baseline risk scoring (MVP):
+    - temperature, current, vibration thresholds
+    - fast rising temperature/current (trend vs previous point)
+    Later: swap/augment with NASA-trained ML model.
+    """
+    reasons: list[str] = []
+    recommendations: list[str] = []
+    eta_seconds: float | None = None
+    eta_label: str | None = None
+    baseline_z_max: float | None = None
+
+    # These are demo thresholds for a макет. You can tune per your motor.
+    temp_warn, temp_crit = 55.0, 70.0
+    amps_warn, amps_crit = 1.5, 2.5
+    vib_warn, vib_crit = 350.0, 700.0
+    baseline = get_baseline()
+
+    # Smooth vibration for NASA comparisons (baseline + RUL).
+    global _vib_ema_raw
+    global _last_pwm, _last_pwm_change_t, _baseline_warn_streak, _baseline_crit_streak
+    now_mono = time.monotonic()
+
+    # Track PWM changes to suppress short transients (common with RMS/high-pass metrics).
+    if not current.is_running:
+        _last_pwm = None
+        _last_pwm_change_t = None
+        _baseline_warn_streak = 0
+        _baseline_crit_streak = 0
+    else:
+        if _last_pwm is None:
+            _last_pwm = int(current.pwm)
+            _last_pwm_change_t = now_mono
+        elif int(current.pwm) != int(_last_pwm):
+            _last_pwm = int(current.pwm)
+            _last_pwm_change_t = now_mono
+            _baseline_warn_streak = 0
+            _baseline_crit_streak = 0
+            # Reset EMA to the new operating point to converge faster.
+            _vib_ema_raw = float(current.vibration)
+
+    transient_s = max(0.0, float(_NASA_TRANSIENT_SECONDS))
+    pwm_transient = (
+        current.is_running
+        and _last_pwm_change_t is not None
+        and (now_mono - float(_last_pwm_change_t)) < transient_s
+    )
+
+    if not current.is_running:
+        _vib_ema_raw = None
+        vib_nasa_raw = float(current.vibration)
+        vib_nasa_raw_prev = vib_nasa_raw
+    else:
+        alpha = max(0.01, min(1.0, float(_NASA_VIBRATION_EMA_ALPHA)))
+        prev_ema = _vib_ema_raw
+        if _vib_ema_raw is None:
+            _vib_ema_raw = float(current.vibration)
+        else:
+            _vib_ema_raw = (1.0 - alpha) * float(_vib_ema_raw) + alpha * float(current.vibration)
+        vib_nasa_raw = float(_vib_ema_raw)
+        vib_nasa_raw_prev = float(prev_ema) if prev_ema is not None else vib_nasa_raw
+
+    temp_component = 0.0
+    if current.is_running and current.temp_c >= temp_warn:
+        temp_component = (current.temp_c - temp_warn) / max(1.0, (temp_crit - temp_warn))
+        reasons.append("Температура повышена")
+        recommendations.append("Проверить охлаждение и вентиляцию")
+
+    amps_component = 0.0
+    if current.is_running and current.amps >= amps_warn:
+        amps_component = (current.amps - amps_warn) / max(1.0, (amps_crit - amps_warn))
+        reasons.append("Ток повышен (возможна перегрузка)")
+        recommendations.append("Проверить нагрузку/заклинивание, питание, драйвер")
+
+    vib_component = 0.0
+    # If a NASA baseline is provided, prefer its z-score logic over fixed absolute thresholds.
+    if current.is_running and baseline is None and current.vibration >= vib_warn:
+        vib_component = (current.vibration - vib_warn) / max(1.0, (vib_crit - vib_warn))
+        reasons.append("Вибрация повышена (возможен износ подшипника/дисбаланс)")
+        recommendations.append("Проверить подшипники, крепления, балансировку")
+
+    trend_component = 0.0
+    if current.is_running and previous is not None:
+        dt = (current.ts - previous.ts).total_seconds()
+        if dt >= 0.25:
+            temp_rate = (current.temp_c - previous.temp_c) / dt  # °C/s
+            amps_rate = (current.amps - previous.amps) / dt  # A/s
+            if temp_rate > 0.06 and (current.temp_c >= temp_warn or previous.temp_c >= temp_warn):  # ~3.6°C/min
+                trend_component = max(trend_component, _clamp01((temp_rate - 0.06) / 0.10))
+                reasons.append("Температура быстро растёт")
+                recommendations.append("Снизить PWM/нагрузку, проверить охлаждение")
+                if current.temp_c < temp_crit:
+                    eta = (temp_crit - current.temp_c) / max(1e-6, temp_rate)
+                    if eta > 0:
+                        eta_seconds = eta if eta_seconds is None else min(eta_seconds, eta)
+                        eta_label = "До критической температуры"
+            if amps_rate > 0.01 and (current.amps >= amps_warn or previous.amps >= amps_warn):
+                trend_component = max(trend_component, _clamp01((amps_rate - 0.01) / 0.03))
+                reasons.append("Ток быстро растёт")
+                recommendations.append("Проверить перегрузку, снизить PWM/нагрузку")
+                if current.amps < amps_crit:
+                    eta = (amps_crit - current.amps) / max(1e-6, amps_rate)
+                    if eta > 0:
+                        eta_seconds = eta if eta_seconds is None else min(eta_seconds, eta)
+                        eta_label = "До критического тока"
+
+    score = _clamp01(max(temp_component, amps_component, vib_component, trend_component))
+
+    # Optional NASA-based baseline anomaly (if nasa_baseline.json exists)
+    # NOTE: Only meaningful while the motor is running; otherwise "stopped" values
+    # (very low vibration / pulse_rate) will look anomalous vs run-to-failure data.
+    baseline_component = 0.0
+    if current.is_running and baseline is not None and not pwm_transient:
+        feats = extract_features(current=current, previous=previous)
+        warn_z = max(0.1, float(_NASA_BASELINE_WARN_Z))
+        crit_z = max(warn_z + 0.1, float(_NASA_BASELINE_CRIT_Z))
+        # z-score based anomaly
+        def z(name: str, value: float) -> float | None:
+            st = baseline.features.get(name)
+            if st is None:
+                return None
+            # For vibration we care primarily about "higher than baseline".
+            # Low vibration can be normal at lower PWM/load and should not trigger alerts.
+            if name == "vibration":
+                return max(0.0, (value - st.mean) / st.std)
+            return abs((value - st.mean) / st.std)
+
+        z_values: list[float] = []
+        z_values_prev: list[float] = []
+        for name, value in [
+            ("temp_c", feats.temp_c),
+            ("amps", feats.amps),
+            ("vibration", vib_nasa_raw * _NASA_VIBRATION_SCALE),
+            ("pulse_rate", feats.pulse_rate),
+        ]:
+            zv = z(name, value)
+            if zv is not None:
+                z_values.append(zv)
+
+        if previous is not None and previous.is_running:
+            for name, value in [
+                ("temp_c", float(previous.temp_c)),
+                ("amps", float(previous.amps)),
+                ("vibration", vib_nasa_raw_prev * _NASA_VIBRATION_SCALE),
+            ]:
+                zv = z(name, value)
+                if zv is not None:
+                    z_values_prev.append(zv)
+
+        if z_values:
+            z_cur = float(max(z_values))
+            baseline_z_max = z_cur
+
+            # Require N consecutive samples above threshold to avoid flicker.
+            confirm_n = max(1, int(_NASA_BASELINE_CONFIRM_SAMPLES))
+            if z_cur >= crit_z:
+                _baseline_crit_streak += 1
+            else:
+                _baseline_crit_streak = 0
+
+            if z_cur >= warn_z:
+                _baseline_warn_streak += 1
+            else:
+                _baseline_warn_streak = 0
+
+            if _baseline_crit_streak >= confirm_n:
+                baseline_component = 1.0
+            elif _baseline_warn_streak >= confirm_n:
+                ratio = (z_cur - warn_z) / max(1e-6, (crit_z - warn_z))
+                baseline_component = 0.4 + 0.35 * _clamp01(ratio)  # warning band: 0.4..0.75
+            else:
+                baseline_component = 0.0
+
+            if baseline_component > 0.0:
+                reasons.append(
+                    f"NASA baseline: z={z_cur:.2f} (confirm={confirm_n}, warn≥{warn_z:.1f}, crit≥{crit_z:.1f})"
+                )
+                recommendations.append("Проверить узлы с отклонениями; собрать больше данных для обучения")
+
+        score = _clamp01(max(score, baseline_component))
+
+    # Optional NASA RUL estimate (if nasa_rul_model.json exists)
+    # Uses vibration envelope alignment to approximate remaining time to failure.
+    if current.is_running and nasa_rul_active() and not pwm_transient:
+        vib_cal = float(vib_nasa_raw) * _NASA_VIBRATION_SCALE
+        rul = estimate_rul_seconds(vibration=vib_cal)
+        if rul is not None:
+            # Expose ETA in API/UI
+            if eta_seconds is None or rul < eta_seconds:
+                eta_seconds = float(rul)
+                eta_label = "До отказа (NASA IMS)"
+
+            # Convert RUL into an additional risk component.
+            # - critical at <= crit seconds
+            # - warning increases as RUL approaches warn threshold
+            warn_s = max(1.0, float(_NASA_RUL_WARN_SECONDS))
+            crit_s = max(0.0, min(warn_s, float(_NASA_RUL_CRIT_SECONDS)))
+            if rul <= crit_s:
+                rul_component = 1.0
+            elif rul <= warn_s:
+                rul_component = _clamp01((warn_s - float(rul)) / max(1.0, (warn_s - crit_s)))
+            else:
+                rul_component = 0.0
+
+            if rul_component > 0.0:
+                mins = int(round(float(rul) / 60.0))
+                reasons.append(f"Оценка ресурса по NASA IMS: ~{mins} мин")
+                recommendations.append("Запланировать обслуживание (подшипник/вибрация)")
+                if float(_NASA_RUL_AFFECTS_SCORE) >= 0.5:
+                    score = _clamp01(max(score, rul_component))
+    if score >= 0.75:
+        level = "critical"
+    elif score >= 0.4:
+        level = "warning"
+    else:
+        level = "normal"
+
+    # When stopped, show a neutral status (otherwise a last high vibration sample can keep WARNING/CRITICAL).
+    if not current.is_running:
+        score = 0.0
+        level = "normal"
+        health = 100
+        reasons = ["Остановлено"]
+        recommendations = []
+        eta_seconds = None
+        eta_label = None
+        baseline_z_max = None
+    else:
+        health = int(round(100 * (1.0 - score)))
+
+    unique_reasons = _dedup(reasons)
+    recommendations = _dedup(recommendations)
+
+    return Risk(
+        score=score,
+        level=level,
+        health=health,
+        reasons=unique_reasons,
+        eta_seconds=float(eta_seconds) if eta_seconds is not None else None,
+        eta_label=eta_label,
+        recommendations=recommendations,
+        baseline_z_max=baseline_z_max,
+    )

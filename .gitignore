@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.python-version
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Data
+*.db
+backend/data/
+
+# OS
+Thumbs.db
+Desktop.ini
+
