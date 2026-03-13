@@ -8,14 +8,27 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .db import Db
 from .features import extract_features
-from .models import DerivedOut, HealthOut, HistoryOut, RiskOut, TelemetryIn, TelemetryOut, utc_now
+from .models import (
+    ControlAckIn,
+    ControlClaimIn,
+    ControlCommandIn,
+    ControlCommandOut,
+    ControlStateOut,
+    DerivedOut,
+    HealthOut,
+    HistoryOut,
+    RiskOut,
+    TelemetryIn,
+    TelemetryOut,
+    utc_now,
+)
 from .nasa_baseline import baseline_active, baseline_file_exists
 from .risk import score_risk
 from .settings import load_settings
 
 
 settings = load_settings()
-db = Db(db_path=settings.db_path, db_url=settings.db_url)
+db = Db(db_url=settings.db_url)
 
 app = FastAPI(title="Digital Twin Motor API", version="0.1.0")
 app.add_middleware(
@@ -91,16 +104,26 @@ def _to_out(row, previous_row) -> TelemetryOut:
     )
 
 
+def _control_to_out(row) -> ControlCommandOut:
+    return ControlCommandOut(
+        id=row.id,
+        ts=row.ts,
+        action=row.action,  # type: ignore[arg-type]
+        status=row.status,  # type: ignore[arg-type]
+        source=row.source,
+        claimed_by=row.claimed_by,
+        claimed_at=row.claimed_at,
+        done_at=row.done_at,
+        error=row.error,
+    )
+
+
 @app.get("/api/health", response_model=HealthOut)
 async def health() -> HealthOut:
-    if db.kind().startswith("sqlite"):
-        target = str(db.path) if db.path is not None else db.safe_url()
-    else:
-        target = db.safe_url()
     return HealthOut(
         status="ok",
         db_kind=db.kind(),
-        db_target=target,
+        db_target=db.safe_url(),
         nasa_baseline_active=baseline_active(),
         nasa_baseline_file_exists=baseline_file_exists(),
         ws_clients=await ws_hub.count(),
@@ -123,6 +146,52 @@ async def ingest_telemetry(payload: TelemetryIn) -> TelemetryOut:
     out = _to_out(row, prev)
     await ws_hub.broadcast_json({"type": "telemetry", "data": out.model_dump(mode="json")})
     return out
+
+
+@app.post("/api/control", response_model=ControlCommandOut)
+async def enqueue_control(payload: ControlCommandIn) -> ControlCommandOut:
+    if payload.action in ("pwm_up", "pwm_down"):
+        cur = db.get_desired_pwm().int_value or 0
+        step = 10
+        desired = cur + step if payload.action == "pwm_up" else cur - step
+        st = db.set_desired_pwm(value=desired)
+        await ws_hub.broadcast_json(
+            {
+                "type": "control_state",
+                "data": ControlStateOut(desired_pwm=st.int_value or 0, updated_at=st.ts).model_dump(mode="json"),
+            }
+        )
+
+    row = db.insert_command(action=payload.action, source=payload.source)
+    out = _control_to_out(row)
+    await ws_hub.broadcast_json({"type": "control", "data": out.model_dump(mode="json")})
+    return out
+
+
+@app.post("/api/control/claim", response_model=ControlCommandOut | None)
+async def claim_control(payload: ControlClaimIn) -> ControlCommandOut | None:
+    row = db.claim_next_command(claimed_by=payload.client_id)
+    if row is None:
+        return None
+    return _control_to_out(row)
+
+
+@app.post("/api/control/{cmd_id}/ack", response_model=ControlCommandOut)
+async def ack_control(cmd_id: int, payload: ControlAckIn) -> ControlCommandOut:
+    row = db.ack_command(cmd_id=cmd_id, ok=payload.ok, error=payload.error)
+    if row is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="command not found")
+    out = _control_to_out(row)
+    await ws_hub.broadcast_json({"type": "control_ack", "data": out.model_dump(mode="json")})
+    return out
+
+
+@app.get("/api/control/state", response_model=ControlStateOut)
+async def control_state() -> ControlStateOut:
+    st = db.get_desired_pwm()
+    return ControlStateOut(desired_pwm=st.int_value or 0, updated_at=st.ts)
 
 
 @app.get("/api/latest", response_model=TelemetryOut)
@@ -163,7 +232,6 @@ async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     await ws_hub.add(ws)
     try:
-        # Push latest on connect
         latest_row = db.latest()
         if latest_row is not None:
             prev = db.previous(before_id=latest_row.id)
@@ -171,7 +239,6 @@ async def ws_endpoint(ws: WebSocket) -> None:
             await ws.send_json({"type": "telemetry", "data": out.model_dump(mode="json")})
 
         while True:
-            # keep connection alive; client messages are optional
             await ws.receive_text()
     except WebSocketDisconnect:
         pass

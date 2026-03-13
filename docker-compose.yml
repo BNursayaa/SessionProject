@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: digital_twin_postgres
+    # Keep secrets (e.g. POSTGRES_PASSWORD) out of git:
+    # - copy .env.example -> .env (repo root)
+    # - edit .env locally (it's ignored by .gitignore)
+    env_file:
+      - .env
+    ports:
+      # host_port:container_port
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - digital_twin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d digital_twin"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  digital_twin_pgdata:

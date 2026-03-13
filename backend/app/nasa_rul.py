@@ -114,7 +114,6 @@ def estimate_rul_seconds(*, vibration: float) -> float | None:
     v = float(vibration)
     env = [p.vibration_envelope for p in pts]
 
-    # Find earliest index where envelope >= v (monotonic envelope).
     lo, hi = 0, len(env) - 1
     if v <= env[0]:
         idx = 0

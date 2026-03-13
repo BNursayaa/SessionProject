@@ -1,5 +1,3 @@
-// Add this to your Arduino sketch (UNO)
-// Call printTelemetryJson(...) once per second after reading sensors.
 
 void printTelemetryJson(
   float tempC,

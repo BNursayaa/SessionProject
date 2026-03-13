@@ -80,8 +80,6 @@ def main() -> None:
     args = p.parse_args()
 
     root = Path(args.dir)
-    # IMS dataset files are often named like "2003.10.22.12.06.24" (numeric suffix),
-    # so filtering strictly by ".txt" would miss almost all of them.
     ignore_ext = {
         ".zip",
         ".7z",

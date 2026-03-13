@@ -69,3 +69,47 @@ class HealthOut(BaseModel):
     ws_clients: int
 
     model_config = {"extra": "forbid"}
+
+
+ControlAction = Literal["start", "stop", "pwm_up", "pwm_down"]
+
+
+class ControlCommandIn(BaseModel):
+    action: ControlAction
+    source: str | None = Field(default=None, max_length=200, description="Optional caller id (ui, script, etc)")
+
+    model_config = {"extra": "forbid"}
+
+
+class ControlCommandOut(BaseModel):
+    id: int
+    ts: datetime
+    action: ControlAction
+    status: Literal["pending", "claimed", "done", "failed"]
+    source: str | None = None
+    claimed_by: str | None = None
+    claimed_at: datetime | None = None
+    done_at: datetime | None = None
+    error: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class ControlClaimIn(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=200)
+
+    model_config = {"extra": "forbid"}
+
+
+class ControlAckIn(BaseModel):
+    ok: bool = Field(..., description="true if command was delivered to the device")
+    error: str | None = Field(default=None, max_length=500)
+
+    model_config = {"extra": "forbid"}
+
+
+class ControlStateOut(BaseModel):
+    desired_pwm: int = Field(..., ge=0, le=255)
+    updated_at: datetime
+
+    model_config = {"extra": "forbid"}

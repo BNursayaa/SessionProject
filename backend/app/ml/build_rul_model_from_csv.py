@@ -97,8 +97,6 @@ def main() -> None:
     if len(vib) < 10:
         raise SystemExit(f"Not enough rows ({len(vib)}) in {in_path}. Did you point to the extracted IMS folder?")
 
-    # Build time axis (seconds from start).
-    # Prefer parsed timestamps; fallback to uniform 1-step increments.
     t0: datetime | None = None
     parsed_pairs: list[tuple[datetime, float]] = []
     for t, v in zip(times, vib):

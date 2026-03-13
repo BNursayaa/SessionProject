@@ -44,7 +44,6 @@ def parse_line(line: str) -> Telemetry | None:
     if not s:
         return None
 
-    # JSON per line (recommended)
     if s.startswith("{") and s.endswith("}"):
         obj = json.loads(s)
         return Telemetry(
@@ -56,7 +55,6 @@ def parse_line(line: str) -> Telemetry | None:
             is_running=bool(obj["is_running"]),
         )
 
-    # CSV fallback: temp,amps,vibration,pulses,pwm,is_running
     parts = [p.strip() for p in s.split(",")]
     if len(parts) == 6:
         return Telemetry(
@@ -76,7 +74,6 @@ def post_telemetry(api_base: str, telemetry: Telemetry, timeout_s: float = 2.0) 
     payload = telemetry.to_api_payload()
     r = requests.post(url, json=payload, timeout=timeout_s)
     if r.status_code >= 400:
-        # FastAPI returns useful JSON validation details for 422; include it in the error.
         detail: Any
         try:
             detail = r.json()
@@ -89,6 +86,30 @@ def post_telemetry(api_base: str, telemetry: Telemetry, timeout_s: float = 2.0) 
     r.raise_for_status()
 
 
+def claim_control(api_base: str, client_id: str, timeout_s: float = 2.0) -> dict[str, Any] | None:
+    url = f"{api_base.rstrip('/')}/api/control/claim"
+    r = requests.post(url, json={"client_id": client_id}, timeout=timeout_s)
+    if r.status_code >= 400:
+        detail: Any
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise requests.HTTPError(f"{r.status_code} {r.reason} for {url}; detail={detail}", response=r)
+    obj = r.json()
+    return obj or None
+
+
+def ack_control(api_base: str, cmd_id: int, *, ok: bool, error: str | None = None, timeout_s: float = 2.0) -> None:
+    url = f"{api_base.rstrip('/')}/api/control/{int(cmd_id)}/ack"
+    payload: dict[str, Any] = {"ok": bool(ok)}
+    if error:
+        payload["error"] = str(error)[:500]
+    r = requests.post(url, json=payload, timeout=timeout_s)
+    if r.status_code >= 400:
+        return
+
+
 def simulate_stream(interval_s: float) -> Iterable[Telemetry]:
     is_running = True
     pwm = 120
@@ -98,7 +119,6 @@ def simulate_stream(interval_s: float) -> Iterable[Telemetry]:
     vib = 90.0
 
     while True:
-        # Random events
         if random.random() < 0.02:
             is_running = not is_running
         if random.random() < 0.08 and is_running:
@@ -138,18 +158,50 @@ def run_serial(api_base: str, port: str, baud: int, verbose: bool) -> None:
 
     reconnect_delay_s = 1.0
 
+    gateway_id = os.getenv("DT_GATEWAY_ID") or f"gateway:{port}"
+    control_poll_s = float(os.getenv("DT_CONTROL_POLL_S", "0.5"))
+    control_timeout_s = float(os.getenv("DT_CONTROL_TIMEOUT_S", "1.5"))
+
     while True:
         try:
-            with serial.Serial(port=port, baudrate=baud, timeout=1) as ser:
+            with serial.Serial(port=port, baudrate=baud, timeout=0.2) as ser:
                 print(f"[gateway] reading serial {port} @ {baud}")
+                last_control_poll = 0.0
                 while True:
+                    now_m = time.monotonic()
+                    if control_poll_s > 0 and (now_m - last_control_poll) >= control_poll_s:
+                        last_control_poll = now_m
+                        try:
+                            cmd = claim_control(api_base, gateway_id, timeout_s=control_timeout_s)
+                            if cmd and isinstance(cmd, dict):
+                                cmd_id = int(cmd.get("id", 0) or 0)
+                                action = str(cmd.get("action", "")).strip().lower()
+                                wire_map = {
+                                    "start": b"START\n",
+                                    "stop": b"STOP\n",
+                                    "pwm_up": b"PWM_UP\n",
+                                    "pwm_down": b"PWM_DOWN\n",
+                                }
+                                wire = wire_map.get(action)
+                                if cmd_id > 0 and wire:
+                                    try:
+                                        ser.write(wire)
+                                        ser.flush()
+                                        ack_control(api_base, cmd_id, ok=True, timeout_s=control_timeout_s)
+                                        if verbose:
+                                            print(f"[gateway] control -> serial: {action.upper()} (id={cmd_id})")
+                                    except Exception as e:
+                                        ack_control(api_base, cmd_id, ok=False, error=str(e), timeout_s=control_timeout_s)
+                                        print(f"[gateway] control serial write failed: {e}", file=sys.stderr)
+                        except Exception as e:
+                            if verbose:
+                                print(f"[gateway] control poll failed: {e}", file=sys.stderr)
+
                     try:
                         raw = ser.readline()
                     except KeyboardInterrupt:
                         raise
                     except Exception as e:
-                        # Common on Windows when the board resets or the COM port is grabbed by another app:
-                        # "GetOverlappedResult failed (PermissionError(13, 'Отказано в доступе.', ...))"
                         print(f"[gateway] serial read error: {e}; reconnecting...", file=sys.stderr)
                         break
 

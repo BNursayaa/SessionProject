@@ -20,9 +20,6 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-# NASA IMS Bearings baseline uses a different vibration unit/scale than our Arduino "vibrationIntensity".
-# Use a calibration multiplier to bring device values into the same rough range for z-score comparison.
-# Example (typical device vibration ~327, baseline mean ~0.15): DT_NASA_VIBRATION_SCALE=0.00046
 _NASA_VIBRATION_SCALE = _env_float("DT_NASA_VIBRATION_SCALE", 1.0)
 _NASA_RUL_WARN_SECONDS = _env_float("DT_NASA_RUL_WARN_SECONDS", 3600.0)
 _NASA_RUL_CRIT_SECONDS = _env_float("DT_NASA_RUL_CRIT_SECONDS", 600.0)
@@ -33,12 +30,8 @@ _NASA_VIBRATION_EMA_ALPHA = _env_float("DT_NASA_VIBRATION_EMA_ALPHA", 0.2)
 _NASA_TRANSIENT_SECONDS = _env_float("DT_NASA_TRANSIENT_SECONDS", 2.0)
 _NASA_BASELINE_CONFIRM_SAMPLES = int(_env_float("DT_NASA_BASELINE_CONFIRM_SAMPLES", 3.0))
 
-# Module-level EMA state for smoothing noisy vibration before NASA comparisons.
-# This reduces false WARNING/CRITICAL due to single-sample spikes from the MPU6050-derived metric.
 _vib_ema_raw: float | None = None
 
-# After PWM changes, the derived vibration metric can spike transiently.
-# We ignore NASA baseline/RUL scoring for a short period after PWM changes to avoid flicker.
 _last_pwm: int | None = None
 _last_pwm_change_t: float | None = None
 _baseline_warn_streak: int = 0
@@ -82,18 +75,15 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
     eta_label: str | None = None
     baseline_z_max: float | None = None
 
-    # These are demo thresholds for a макет. You can tune per your motor.
     temp_warn, temp_crit = 55.0, 70.0
     amps_warn, amps_crit = 1.5, 2.5
     vib_warn, vib_crit = 350.0, 700.0
     baseline = get_baseline()
 
-    # Smooth vibration for NASA comparisons (baseline + RUL).
     global _vib_ema_raw
     global _last_pwm, _last_pwm_change_t, _baseline_warn_streak, _baseline_crit_streak
     now_mono = time.monotonic()
 
-    # Track PWM changes to suppress short transients (common with RMS/high-pass metrics).
     if not current.is_running:
         _last_pwm = None
         _last_pwm_change_t = None
@@ -108,7 +98,6 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
             _last_pwm_change_t = now_mono
             _baseline_warn_streak = 0
             _baseline_crit_streak = 0
-            # Reset EMA to the new operating point to converge faster.
             _vib_ema_raw = float(current.vibration)
 
     transient_s = max(0.0, float(_NASA_TRANSIENT_SECONDS))
@@ -145,7 +134,6 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
         recommendations.append("Проверить нагрузку/заклинивание, питание, драйвер")
 
     vib_component = 0.0
-    # If a NASA baseline is provided, prefer its z-score logic over fixed absolute thresholds.
     if current.is_running and baseline is None and current.vibration >= vib_warn:
         vib_component = (current.vibration - vib_warn) / max(1.0, (vib_crit - vib_warn))
         reasons.append("Вибрация повышена (возможен износ подшипника/дисбаланс)")
@@ -178,21 +166,15 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
 
     score = _clamp01(max(temp_component, amps_component, vib_component, trend_component))
 
-    # Optional NASA-based baseline anomaly (if nasa_baseline.json exists)
-    # NOTE: Only meaningful while the motor is running; otherwise "stopped" values
-    # (very low vibration / pulse_rate) will look anomalous vs run-to-failure data.
     baseline_component = 0.0
     if current.is_running and baseline is not None and not pwm_transient:
         feats = extract_features(current=current, previous=previous)
         warn_z = max(0.1, float(_NASA_BASELINE_WARN_Z))
         crit_z = max(warn_z + 0.1, float(_NASA_BASELINE_CRIT_Z))
-        # z-score based anomaly
         def z(name: str, value: float) -> float | None:
             st = baseline.features.get(name)
             if st is None:
                 return None
-            # For vibration we care primarily about "higher than baseline".
-            # Low vibration can be normal at lower PWM/load and should not trigger alerts.
             if name == "vibration":
                 return max(0.0, (value - st.mean) / st.std)
             return abs((value - st.mean) / st.std)
@@ -223,7 +205,6 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
             z_cur = float(max(z_values))
             baseline_z_max = z_cur
 
-            # Require N consecutive samples above threshold to avoid flicker.
             confirm_n = max(1, int(_NASA_BASELINE_CONFIRM_SAMPLES))
             if z_cur >= crit_z:
                 _baseline_crit_streak += 1
@@ -251,20 +232,14 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
 
         score = _clamp01(max(score, baseline_component))
 
-    # Optional NASA RUL estimate (if nasa_rul_model.json exists)
-    # Uses vibration envelope alignment to approximate remaining time to failure.
     if current.is_running and nasa_rul_active() and not pwm_transient:
         vib_cal = float(vib_nasa_raw) * _NASA_VIBRATION_SCALE
         rul = estimate_rul_seconds(vibration=vib_cal)
         if rul is not None:
-            # Expose ETA in API/UI
             if eta_seconds is None or rul < eta_seconds:
                 eta_seconds = float(rul)
                 eta_label = "До отказа (NASA IMS)"
 
-            # Convert RUL into an additional risk component.
-            # - critical at <= crit seconds
-            # - warning increases as RUL approaches warn threshold
             warn_s = max(1.0, float(_NASA_RUL_WARN_SECONDS))
             crit_s = max(0.0, min(warn_s, float(_NASA_RUL_CRIT_SECONDS)))
             if rul <= crit_s:
@@ -287,7 +262,6 @@ def score_risk(*, current: TelemetryRow, previous: TelemetryRow | None) -> Risk:
     else:
         level = "normal"
 
-    # When stopped, show a neutral status (otherwise a last high vibration sample can keep WARNING/CRITICAL).
     if not current.is_running:
         score = 0.0
         level = "normal"

@@ -6,7 +6,6 @@
 #include <DallasTemperature.h>
 #include <math.h>
 
-// --- ПИНЫ УСТРОЙСТВ ---
 #define PIN_IN1 6         // PWM на драйвер (скорость)
 #define PIN_IN2 7         // DIR на драйвер (направление)
 #define PIN_ENC_A 8
@@ -16,9 +15,6 @@
 #define PIN_DS18B20 2
 #define SD_CS 4
 
-// --- PWM TUNING ---
-// Many DC motors won't spin reliably below some PWM due to static friction / load.
-// We treat PWM below PWM_MIN_SPIN as "motor off" (output=0) to keep telemetry logical.
 const int PWM_STEP = 10;
 const int PWM_MIN_SPIN = 30;          // below this: output=0
 const int PWM_KICK = 100;             // short kick to overcome inertia
@@ -29,15 +25,14 @@ int pwmOutFromSet(int setPwm) {
   return constrain(setPwm, 0, 255);
 }
 
-// --- ОБЪЕКТЫ ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 MPU6050 mpu(0x68);
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
-// --- ПЕРЕМЕННЫЕ МОНИТОРИНГА ---
 volatile long pulseCount = 0;
 int motorSpeed = 0;               // 0..255 (0 = stop)
+int lastPwmOut = 0;               // last applied output PWM (after deadzone)
 bool isRunning = false;
 unsigned long lastScanTime = 0;
 
@@ -45,18 +40,15 @@ float lastTemp = 0;
 float lastAmps = 0;
 float vibrationRms = 0.0f; // RMS вибрация (для сайта) — ближе к NASA IMS RMS
 
-// --- ПЕРЕМЕННЫЕ ПИКОВ (MAX) ---
 float maxTemp = 0;
 float maxAmps = 0;
 float maxVib = 0.0f;              // пиковая RMS вибрация (для LCD/логов)
 int zeroPoint = 512;              // ACS712 zero calibration
 
-// Обработчик прерывания для счётчика
 void countPulse() {
   pulseCount++;
 }
 
-// Прототипы функций
 void saveDataToSD();
 void showIdleScreen();
 void updateIdlePwmLine();
@@ -66,11 +58,11 @@ void updateResearchDisplay(float tempC, float amps, long pulses, float mvib);
 void updateVibrationRms(bool running);
 void printTelemetryJson(float tempC, float amps, float vibration, long pulses, int pwm, bool isRunning);
 void updateTempNonBlocking();
+bool startMotor();
+void stopMotor();
+void handleSerialControl();
 
 
-// ================================================================
-// УСТАНОВКА
-// ================================================================
 void setup() {
   pinMode(PIN_IN1, OUTPUT);
   pinMode(PIN_IN2, OUTPUT);
@@ -81,7 +73,6 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(PIN_PULSE), countPulse, FALLING);
 
-  // Safety: ensure motor is OFF on boot/reset.
   digitalWrite(PIN_IN2, LOW);
   analogWrite(PIN_IN1, 0);
 
@@ -92,7 +83,6 @@ void setup() {
 
   Serial.begin(115200);
 
-  // 1) Калибровка амперметра (ACS712)
   lcd.print(F("ACS CALIBRATE..."));
   long sum = 0;
   for (int i = 0; i < 100; i++) {
@@ -101,14 +91,12 @@ void setup() {
   }
   zeroPoint = sum / 100;
 
-  // 2) MPU6050
   lcd.clear();
   lcd.print(F("MPU INIT..."));
   mpu.initialize();
   mpu.setSleepEnabled(false);
   delay(500);
 
-  // 3) Температура / SD
   sensors.begin();
   sensors.setResolution(9);
   sensors.setWaitForConversion(false); // обязательно для неблокирующего режима
@@ -125,65 +113,17 @@ void setup() {
 }
 
 
-// ================================================================
-// ОСНОВНОЙ ЦИКЛ
-// ================================================================
 void loop() {
+  handleSerialControl();
+
   static bool lastSwState = HIGH;
   bool swState = digitalRead(PIN_ENC_SW);
 
-  // Кнопка энкодера (Старт/Стоп)
   if (swState == LOW && lastSwState == HIGH) {
     delay(50); // антидребезг
-    isRunning = !isRunning;
 
-    if (isRunning) {
-      // Do not start if PWM is too low (motor may not spin).
-      if (pwmOutFromSet(motorSpeed) <= 0) {
-        isRunning = false;
-        lcd.clear();
-        lcd.print(F("SET PWM >= 30"));
-        delay(800);
-        lcd.clear();
-        showIdleScreen();
-        lastSwState = swState;
-        return;
-      }
-      // Сброс перед тестом
-      noInterrupts();
-      pulseCount = 0;
-      interrupts();
-      maxVib = 0;
-      maxAmps = 0;
-      maxTemp = 0;
-
-      // Кикстарт
-      lcd.clear();
-      lcd.print(F("KICKSTARTING..."));
-      int pwmOut = pwmOutFromSet(motorSpeed);
-      int kickSpeed = max(pwmOut, PWM_KICK);
-      digitalWrite(PIN_IN2, LOW);
-      analogWrite(PIN_IN1, kickSpeed);
-      delay(PWM_KICK_MS);
-
-      analogWrite(PIN_IN1, pwmOut);
-      lcd.clear();
-    } else {
-      // Остановка + запись
-      digitalWrite(PIN_IN2, LOW);
-      analogWrite(PIN_IN1, 0);
-
-      noInterrupts();
-      long pulsesSnap = pulseCount;
-      interrupts();
-
-      // Отправить STOP статус на сайт (один раз)
-      printTelemetryJson(lastTemp, lastAmps, vibrationRms, pulsesSnap, 0, false);
-
-      saveDataToSD();
-      lcd.clear();
-      showIdleScreen();
-    }
+    if (isRunning) stopMotor();
+    else startMotor();
   }
   lastSwState = swState;
 
@@ -194,7 +134,6 @@ void loop() {
     bool motorActive = (pwmOut > 0);
     updateVibrationRms(motorActive); // обновляем vibrationRms/maxVib только когда мотор реально крутится
 
-    // раз в 500 мс: ток + отправка на сайт + LCD
     if (millis() - lastScanTime >= 500) {
       lastScanTime = millis();
       scanSensors();
@@ -213,20 +152,149 @@ void loop() {
       updateResearchDisplay(tempC, amps, pulses, mvib);
     }
   } else {
-    // idle режим: только крутилка
     updateVibrationRms(false);
     handleEncoder();
   }
 }
 
 
-// ================================================================
-// ФУНКЦИИ
-// ================================================================
 
-// Вибрация: RMS по окну 1 сек (ближе к NASA IMS RMS).
-// 1) Берём динамику вокруг медленной "базы" (high-pass)
-// 2) Накапливаем dyn^2 и считаем sqrt(mean(dyn^2)) раз в 1 секунду.
+void handleSerialControl() {
+  static char buf[24];
+  static uint8_t idx = 0;
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      buf[idx] = '\0';
+      idx = 0;
+
+      for (uint8_t i = 0; buf[i]; i++) {
+        if (buf[i] >= 'a' && buf[i] <= 'z') buf[i] = (char)(buf[i] - 32);
+      }
+
+      if (!buf[0]) return;
+
+      if (strcmp(buf, "START") == 0) {
+        if (!isRunning) startMotor();
+      } else if (strcmp(buf, "STOP") == 0) {
+        if (isRunning) stopMotor();
+      } else if (strcmp(buf, "PWM_UP") == 0) {
+        motorSpeed = constrain(motorSpeed + PWM_STEP, 0, 255);
+        if (!isRunning) {
+          updateIdlePwmLine();
+        } else {
+          int out = pwmOutFromSet(motorSpeed);
+          if (out == 0 && lastPwmOut > 0) {
+            stopMotor();
+            return;
+          }
+          bool motorActive = (out > 0);
+          if (lastPwmOut == 0 && out > 0) {
+            analogWrite(PIN_IN1, max(out, PWM_KICK));
+            delay(PWM_KICK_MS);
+          }
+          digitalWrite(PIN_IN2, LOW);
+          analogWrite(PIN_IN1, out);
+          lastPwmOut = out;
+
+          noInterrupts();
+          long pulses = pulseCount;
+          interrupts();
+          printTelemetryJson(lastTemp, lastAmps, vibrationRms, pulses, out, motorActive);
+        }
+      } else if (strcmp(buf, "PWM_DOWN") == 0) {
+        motorSpeed = constrain(motorSpeed - PWM_STEP, 0, 255);
+        if (!isRunning) {
+          updateIdlePwmLine();
+        } else {
+          int out = pwmOutFromSet(motorSpeed);
+          if (out == 0 && lastPwmOut > 0) {
+            stopMotor();
+            return;
+          }
+          bool motorActive = (out > 0);
+          if (lastPwmOut == 0 && out > 0) {
+            analogWrite(PIN_IN1, max(out, PWM_KICK));
+            delay(PWM_KICK_MS);
+          }
+          digitalWrite(PIN_IN2, LOW);
+          analogWrite(PIN_IN1, out);
+          lastPwmOut = out;
+
+          noInterrupts();
+          long pulses = pulseCount;
+          interrupts();
+          printTelemetryJson(lastTemp, lastAmps, vibrationRms, pulses, out, motorActive);
+        }
+      } else if (strcmp(buf, "TOGGLE") == 0) {
+        if (isRunning) stopMotor();
+        else startMotor();
+      }
+
+      return;
+    }
+
+    if (idx < sizeof(buf) - 1) {
+      buf[idx++] = c;
+    }
+  }
+}
+
+bool startMotor() {
+  int pwmOut = pwmOutFromSet(motorSpeed);
+
+  if (pwmOut <= 0) {
+    isRunning = false;
+    lcd.clear();
+    lcd.print(F("SET PWM >= 30"));
+    delay(800);
+    lcd.clear();
+    showIdleScreen();
+    return false;
+  }
+
+  isRunning = true;
+  lastPwmOut = pwmOut;
+
+  noInterrupts();
+  pulseCount = 0;
+  interrupts();
+  maxVib = 0;
+  maxAmps = 0;
+  maxTemp = 0;
+
+  lcd.clear();
+  lcd.print(F("KICKSTARTING..."));
+  int kickSpeed = max(pwmOut, PWM_KICK);
+  digitalWrite(PIN_IN2, LOW);
+  analogWrite(PIN_IN1, kickSpeed);
+  delay(PWM_KICK_MS);
+
+  analogWrite(PIN_IN1, pwmOut);
+  lcd.clear();
+  return true;
+}
+
+void stopMotor() {
+  isRunning = false;
+  lastPwmOut = 0;
+
+  digitalWrite(PIN_IN2, LOW);
+  analogWrite(PIN_IN1, 0);
+
+  noInterrupts();
+  long pulsesSnap = pulseCount;
+  interrupts();
+
+  printTelemetryJson(lastTemp, lastAmps, vibrationRms, pulsesSnap, 0, false);
+
+  saveDataToSD();
+  lcd.clear();
+  showIdleScreen();
+}
+
 void updateVibrationRms(bool running) {
   static float lp = 0.0f;                // low-pass baseline (сырой суммы)
   static unsigned long lastSampleMs = 0; // частота выборки
@@ -241,7 +309,6 @@ void updateVibrationRms(bool running) {
   if (windowStartMs == 0) windowStartMs = now;
 
   if (now - lastSampleMs < sampleEveryMs) {
-    // окно могло закончиться, даже если сэмпл не делали
   } else {
     lastSampleMs = now;
 
@@ -273,7 +340,6 @@ void updateVibrationRms(bool running) {
 }
 
 void scanSensors() {
-  // Ток (среднее из 10 замеров)
   long rawSum = 0;
   for (int i = 0; i < 10; i++) rawSum += analogRead(A0);
   lastAmps = abs((rawSum / 10) - zeroPoint) * 0.1;
@@ -310,7 +376,6 @@ void updateIdlePwmLine() {
 
 void handleEncoder() {
   static int lastA = HIGH;
-  static int lastOut = 0;
   int currentA = digitalRead(PIN_ENC_A);
 
   if (currentA != lastA && currentA == LOW) {
@@ -320,25 +385,29 @@ void handleEncoder() {
 
     if (!isRunning) {
       updateIdlePwmLine();
-      lastOut = 0;
+      lastPwmOut = 0;
     }
 
     if (isRunning) {
       digitalWrite(PIN_IN2, LOW);
       int out = pwmOutFromSet(motorSpeed);
       bool motorActive = (out > 0);
-      if (lastOut == 0 && out > 0) {
+      if (out == 0 && lastPwmOut > 0) {
+        stopMotor();
+        lastA = currentA;
+        return;
+      }
+      if (lastPwmOut == 0 && out > 0) {
         analogWrite(PIN_IN1, max(out, PWM_KICK));
         delay(PWM_KICK_MS);
       }
       analogWrite(PIN_IN1, out);
-      lastOut = out;
+      lastPwmOut = out;
 
       noInterrupts();
       long pulses = pulseCount;
       interrupts();
 
-      // PWM өзгерген сәтте сайтқа бірден жіберу
       printTelemetryJson(lastTemp, lastAmps, vibrationRms, pulses, out, motorActive);
     }
   }
@@ -385,7 +454,6 @@ void printTelemetryJson(float tempC, float amps, float vibration, long pulses, i
   Serial.println(F("}"));
 }
 
-// DS18B20 non-blocking update
 void updateTempNonBlocking() {
   static bool pending = false;
   static unsigned long t0 = 0;
@@ -397,7 +465,6 @@ void updateTempNonBlocking() {
     return;
   }
 
-  // 9-bit: ~94ms (берём с запасом)
   if (millis() - t0 >= 110) {
     float t = sensors.getTempCByIndex(0);
     lastTemp = t;
