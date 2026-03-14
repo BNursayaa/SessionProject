@@ -31,6 +31,7 @@ class RiskOut(BaseModel):
     eta_label: str | None = None
     recommendations: list[str] = Field(default_factory=list)
     baseline_z_max: float | None = Field(default=None, ge=0, description="Max z-score vs NASA baseline (if enabled)")
+    ml_score: float | None = Field(default=None, ge=0, le=1, description="ML anomaly score (0..1) if enabled")
 
     model_config = {"extra": "forbid"}
 
@@ -60,12 +61,29 @@ class HistoryOut(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class NasaVibrationOut(BaseModel):
+    mean: float
+    std: float
+    scale: float
+    warn_z: float
+    crit_z: float
+    warn_raw: float | None = None
+    crit_raw: float | None = None
+
+    model_config = {"extra": "forbid"}
+
+
 class HealthOut(BaseModel):
     status: Literal["ok"]
     db_kind: str
     db_target: str
     nasa_baseline_active: bool
     nasa_baseline_file_exists: bool
+    nasa_rul_ml_file_exists: bool = False
+    nasa_rul_ml_active: bool = False
+    ml_anomaly_file_exists: bool = False
+    ml_anomaly_active: bool = False
+    nasa_vibration: NasaVibrationOut | None = None
     ws_clients: int
 
     model_config = {"extra": "forbid"}

@@ -17,13 +17,16 @@ from .models import (
     DerivedOut,
     HealthOut,
     HistoryOut,
+    NasaVibrationOut,
     RiskOut,
     TelemetryIn,
     TelemetryOut,
     utc_now,
 )
 from .nasa_baseline import baseline_active, baseline_file_exists
-from .risk import score_risk
+from .nasa_rul import model_active as nasa_rul_active, model_file_exists as nasa_rul_file_exists
+from .ml.anomaly_iforest import model_active as ml_anomaly_active, model_file_exists as ml_anomaly_file_exists
+from .risk import get_nasa_vibration_thresholds, score_risk
 from .settings import load_settings
 
 
@@ -99,6 +102,7 @@ def _to_out(row, previous_row) -> TelemetryOut:
             eta_label=risk.eta_label,
             recommendations=risk.recommendations,
             baseline_z_max=risk.baseline_z_max,
+            ml_score=risk.ml_score,
         ),
         derived=DerivedOut(pulse_rate=feats.pulse_rate),
     )
@@ -120,12 +124,29 @@ def _control_to_out(row) -> ControlCommandOut:
 
 @app.get("/api/health", response_model=HealthOut)
 async def health() -> HealthOut:
+    nasa_vib = None
+    thr = get_nasa_vibration_thresholds()
+    if thr is not None:
+        nasa_vib = NasaVibrationOut(
+            mean=thr.mean,
+            std=thr.std,
+            scale=thr.scale,
+            warn_z=thr.warn_z,
+            crit_z=thr.crit_z,
+            warn_raw=thr.warn_raw,
+            crit_raw=thr.crit_raw,
+        )
     return HealthOut(
         status="ok",
         db_kind=db.kind(),
         db_target=db.safe_url(),
         nasa_baseline_active=baseline_active(),
         nasa_baseline_file_exists=baseline_file_exists(),
+        nasa_rul_ml_file_exists=nasa_rul_file_exists(),
+        nasa_rul_ml_active=nasa_rul_active(),
+        ml_anomaly_file_exists=ml_anomaly_file_exists(),
+        ml_anomaly_active=ml_anomaly_active(),
+        nasa_vibration=nasa_vib,
         ws_clients=await ws_hub.count(),
     )
 
@@ -133,6 +154,16 @@ async def health() -> HealthOut:
 @app.post("/api/telemetry", response_model=TelemetryOut)
 async def ingest_telemetry(payload: TelemetryIn) -> TelemetryOut:
     ts = payload.ts or utc_now()
+    current_set = db.get_desired_pwm().int_value or 0
+    if int(current_set) != int(payload.pwm):
+        st = db.set_desired_pwm(value=int(payload.pwm))
+        await ws_hub.broadcast_json(
+            {
+                "type": "control_state",
+                "data": ControlStateOut(desired_pwm=st.int_value or 0, updated_at=st.ts).model_dump(mode="json"),
+            }
+        )
+
     row = db.insert(
         ts=ts,
         temp_c=payload.temp_c,

@@ -184,6 +184,7 @@ void handleSerialControl() {
         motorSpeed = constrain(motorSpeed + PWM_STEP, 0, 255);
         if (!isRunning) {
           updateIdlePwmLine();
+          printTelemetryJson(lastTemp, 0.0f, 0.0f, 0, motorSpeed, false);
         } else {
           int out = pwmOutFromSet(motorSpeed);
           if (out == 0 && lastPwmOut > 0) {
@@ -208,6 +209,7 @@ void handleSerialControl() {
         motorSpeed = constrain(motorSpeed - PWM_STEP, 0, 255);
         if (!isRunning) {
           updateIdlePwmLine();
+          printTelemetryJson(lastTemp, 0.0f, 0.0f, 0, motorSpeed, false);
         } else {
           int out = pwmOutFromSet(motorSpeed);
           if (out == 0 && lastPwmOut > 0) {
@@ -288,7 +290,8 @@ void stopMotor() {
   long pulsesSnap = pulseCount;
   interrupts();
 
-  printTelemetryJson(lastTemp, lastAmps, vibrationRms, pulsesSnap, 0, false);
+  (void)pulsesSnap;
+  printTelemetryJson(lastTemp, 0.0f, 0.0f, 0, motorSpeed, false);
 
   saveDataToSD();
   lcd.clear();
@@ -386,6 +389,7 @@ void handleEncoder() {
     if (!isRunning) {
       updateIdlePwmLine();
       lastPwmOut = 0;
+      printTelemetryJson(lastTemp, 0.0f, 0.0f, 0, motorSpeed, false);
     }
 
     if (isRunning) {

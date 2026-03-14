@@ -1,75 +1,91 @@
-# ML / NASA comparison (optional)
+# ML / NASA comparison (MVP explanation)
 
-This backend supports an **optional** NASA-based baseline file:
+Бұл папкада 2 бөлік бар:
+
+1) **Offline (дайындау құралдары)** — датасеттен feature шығару және baseline/RUL файлдарын генерациялау.
+2) **Runtime (backend қолданатын файлдар)** — backend іске қосылғанда оқылатын дайын JSON-дар.
+
+## Runtime файлдар (backend нақты қолданады)
 
 - `backend/app/ml/nasa_baseline.json`
-- enabled via env `DT_NASA_BASELINE_PATH` (or place the file at the default path)
+  - Ішінде baseline статистика болады: әр feature үшін `mean` және `std`.
+  - Backend оны `z-score` арқылы “аномалия” табу үшін қолданады.
+- `backend/app/ml/nasa_rul_model.json` (optional)
+  - IMS “run-to-failure” вибрация envelope қисығы.
+  - Backend осы қисыққа “теңестіріп” ETA (RUL) бағалайды.
 
-## What is “baseline”
+## Offline файлдар (генерация үшін ғана)
 
-It’s a simple “normal behavior” statistics model built from a reference dataset
-(e.g., NASA rotating machinery / bearing dataset):
+- `backend/app/ml/ims_to_features_csv.py`
+  - NASA IMS Bearings raw txt файлдарынан feature шығарады: `rms`, `peak`, `kurtosis`.
+  - Нәтижесі: `ims_features.csv`.
+- `backend/app/ml/build_baseline_from_csv.py`
+  - CSV-дан `mean/std` есептеп `nasa_baseline.json` жасайды.
+- `backend/app/ml/build_rul_model_from_csv.py`
+  - `ims_features.csv` бойынша envelope curve жасап `nasa_rul_model.json` жасайды.
+- `backend/app/ml/ims_features.csv`
+  - Бұл тек аралық artifact (генерация нәтижесі). Runtime үшін міндетті емес.
+  - Қаласаңыз git-қа қоспай, кез келген уақытта қайта генерациялай аласыз.
 
-```json
-{
-  "features": {
-    "temp_c": { "mean": 30.0, "std": 2.0 },
-    "amps": { "mean": 0.4, "std": 0.1 },
-    "vibration": { "mean": 120.0, "std": 40.0 },
-    "pulse_rate": { "mean": 40.0, "std": 8.0 }
-  }
-}
-```
+## “Бұл алгоритм бе, әлде формула ма?”
 
-The backend converts your telemetry into features and computes a z-score anomaly level.
-This is the simplest defensible “NASA comparison” for an MVP.
+Комиссияға түсіндіру үшін дұрыс атауы:
 
-## How to build it (recommended workflow)
+- **Алгоритм (әдіс):** anomaly detection / статистикалық салыстыру
+- **Модель:** baseline статистикасы (`mean/std`)
+- **Есептеу:** z-score
 
-### Option A (best match for your motor): NASA/IMS Bearings
+Z-score формула:
 
-1) Download and unzip NASA IMS Bearings dataset.
-2) Convert raw vibration files to a simple features CSV:
+`z = (x - mean) / std`
 
-```powershell
-python -m app.ml.ims_to_features_csv --dir "C:\\path\\to\\IMS" --out ".\\app\\ml\\ims_features.csv" --feature rms
-```
+Бізде вибрация үшін бір нюанс бар: “төмен вибрация” көбіне проблема емес (төмен PWM/жүктеме),
+сондықтан тек жоғары жағын қараймыз:
 
-Note: IMS files are often named like `2003.10.22.12.06.24` (numeric suffix), so the converter scans
-most file types and skips non-numeric/empty ones automatically.
+`z_vib = max(0, (x - mean) / std)`
 
-3) Build baseline JSON using only the `vibration` column:
+Сосын:
 
-```powershell
-python -m app.ml.build_baseline_from_csv --csv ".\\app\\ml\\ims_features.csv" --out ".\\app\\ml\\nasa_baseline.json" --cols vibration
-```
+- WARNING: `z >= DT_NASA_BASELINE_WARN_Z` бірнеше рет қатарынан (confirm samples)
+- CRITICAL: `z >= DT_NASA_BASELINE_CRIT_Z` бірнеше рет қатарынан
 
-4) Restart backend.
+Бұл “trained ML” (нейронка/RandomForest) емес, бірақ **өндірісте жиі қолданылатын** қарапайым әрі қорғалатын MVP тәсіл.
 
-## Calibration note (important)
+## Неге `nasa_baseline.json`-да тек vibration mean/std ғана?
 
-NASA IMS Bearings vibration features (RMS/peak/kurtosis) are **not** in the same unit as your Arduino
-`vibration` (derived from MPU6050 raw accelerometer counts). If you build a baseline from IMS RMS
-values, you should set a calibration multiplier:
+Себебі NASA IMS Bearings датасеті сіздің Arduino телеметрияңыздағы `temp_c/amps` сияқты сигналдарды бермейді.
+Ортақ ең ұқсас сигнал — вибрация.
+
+Сол үшін біз NASA baseline-ды әзірге тек вибрациямен жасаймыз:
+
+- логикасы дұрыс: “менің мотор вибрациям NASA-дегі ‘normal’ baseline-тан қаншалықты ауытқыды?”
+- бірақ міндетті түрде **калибровка керек**.
+
+## Калибровка (өте маңызды)
+
+NASA IMS вибрациясы (RMS) және сіздің MPU6050 “vibration” мәні бір шкалада емес.
+Сондықтан backend-та scale қолданылады:
 
 - `DT_NASA_VIBRATION_SCALE`
 
-Example: if your typical device vibration is ~`327`, and your baseline JSON has `"mean": 0.1486`,
-then `0.1486 / 327 ≈ 0.00046`.
+Backend NASA-мен салыстыру үшін мынадай түрлендіру жасайды:
 
-## Optional: RUL / ETA model (time-to-failure estimate)
+`vibration_nasa_domain = vibration_raw * DT_NASA_VIBRATION_SCALE`
 
-You can also build a simple *Remaining Useful Life* model from the same `ims_features.csv`:
+Және `/api/health` ішінде `nasa_vibration.warn_raw/crit_raw` көрсетіледі — бұл сіздің raw вибрацияңызда
+қандай мәнде WARNING/CRITICAL шығатынын түсіндіреді.
 
-```powershell
-python -m app.ml.build_rul_model_from_csv --csv ".\\app\\ml\\ims_features.csv" --out ".\\app\\ml\\nasa_rul_model.json"
-```
+## Predictive maintenance “вибрация бойынша” ма?
 
-When `nasa_rul_model.json` exists, the backend estimates `eta_seconds` / `eta_label` as:
-**"До отказа (NASA IMS)"** based on vibration alignment to the run-to-failure envelope.
+Иә:
 
-### Option B (any dataset / your own “normal” data)
+1) **Rule-based** шектер (temp/amps/vibration) — сіздің мотордың өз шкаласында.
+2) **NASA baseline** (z-score) — вибрацияны NASA доменіне scale етіп салыстыру.
+3) **NASA RUL (optional)** — вибрация envelope бойынша ETA.
 
-1) Prepare a CSV with feature columns (example): `temp_c,amps,vibration,pulse_rate`.
-2) Run `build_baseline_from_csv.py` to generate `nasa_baseline.json`.
-3) Restart backend.
+Келесі деңгейге шығару үшін (толық ML):
+- өз моторыңыздан көп дерек жинау
+- fault label (подшипник тозуы, дисбаланс, т.б.) қою
+- feature engineering (RMS/peak/kurtosis/FFT)
+- supervised модель (мысалы XGBoost/RandomForest) үйрету
+

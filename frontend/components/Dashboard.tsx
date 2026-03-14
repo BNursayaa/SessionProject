@@ -21,6 +21,19 @@ type HealthOut = {
   db_target: string;
   nasa_baseline_active: boolean;
   nasa_baseline_file_exists: boolean;
+  nasa_rul_ml_file_exists?: boolean;
+  nasa_rul_ml_active?: boolean;
+  ml_anomaly_file_exists?: boolean;
+  ml_anomaly_active?: boolean;
+  nasa_vibration?: {
+    mean: number;
+    std: number;
+    scale: number;
+    warn_z: number;
+    crit_z: number;
+    warn_raw?: number | null;
+    crit_raw?: number | null;
+  } | null;
   ws_clients: number;
 };
 
@@ -42,6 +55,7 @@ type TelemetryOut = {
     eta_label?: string | null;
     recommendations?: string[];
     baseline_z_max?: number | null;
+    ml_score?: number | null;
   };
   derived: {
     pulse_rate: number;
@@ -69,6 +83,8 @@ type ControlStateOut = {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000/ws";
+const PWM_MIN_SPIN = 30;
+const TELEMETRY_STALE_SECONDS = 8;
 
 function levelColor(level: RiskLevel) {
   if (level === "critical") return "var(--bad)";
@@ -82,7 +98,7 @@ function fmt(n: number, digits = 1) {
 }
 
 function fmtDuration(seconds?: number | null) {
-  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return "-";
   if (seconds < 60) return `${Math.round(seconds)} s`;
   const minutes = seconds / 60;
   if (minutes < 60) return `${minutes.toFixed(1)} min`;
@@ -333,9 +349,18 @@ export default function Dashboard() {
   const etaSeconds = latest?.risk.eta_seconds ?? null;
   const recommendations = latest?.risk.recommendations ?? [];
   const baselineZ = latest?.risk.baseline_z_max ?? null;
+  const mlScore = latest?.risk.ml_score ?? null;
   const pulseRate = latest?.derived?.pulse_rate ?? 0;
   const runningNow = Boolean(latest?.is_running ?? session?.running);
   const lastUpdateAgeSec = latest?.ts ? Math.max(0, Math.round((nowMs - new Date(latest.ts).getTime()) / 1000)) : null;
+  const telemetryStale = lastUpdateAgeSec != null && lastUpdateAgeSec > TELEMETRY_STALE_SECONDS;
+  const outPwm = latest?.is_running ? (latest?.pwm ?? 0) : 0;
+  const deadzoneActive = desiredPwm > 0 && desiredPwm < PWM_MIN_SPIN;
+  const displayTemp = telemetryStale ? null : (latest?.temp_c ?? 0);
+  const displayAmps = telemetryStale || !runningNow ? 0 : (latest?.amps ?? 0);
+  const displayVibration = telemetryStale || !runningNow ? 0 : (latest?.vibration ?? 0);
+  const displayPulses = telemetryStale || !runningNow ? 0 : (latest?.pulses ?? 0);
+  const displayPulseRate = telemetryStale || !runningNow ? 0 : pulseRate;
 
   async function sendControl(action: ControlAction) {
     setControlBusy(true);
@@ -375,7 +400,7 @@ export default function Dashboard() {
     <div className="grid">
       <div className="panel card">
         <div className="row">
-          <div className="cardLabel">Статус</div>
+          <div className="cardLabel">Status</div>
           <div className="pill">
             <span className="dot" style={{ background: wsStatus === "connected" ? "var(--good)" : "var(--bad)" }} />
             WS: {wsStatus}
@@ -385,15 +410,21 @@ export default function Dashboard() {
           {level.toUpperCase()}
         </div>
         <div className="reasons">
-          {(latest?.risk.reasons ?? []).join(" · ") || "—"}
+          {(latest?.risk.reasons ?? []).join(" | ") || "-"}
           {latest?.ts ? (
               <>
                 <br />
                 <span style={{ opacity: 0.85 }}>Last update:</span> {new Date(latest.ts).toLocaleString()}
-                {wsStatus !== "connected" && lastUpdateAgeSec != null ? (
+                {lastUpdateAgeSec != null ? (
                   <>
                     <br />
                     <span style={{ opacity: 0.85 }}>Age:</span> {lastUpdateAgeSec}s
+                  </>
+                ) : null}
+                {telemetryStale ? (
+                  <>
+                    <br />
+                    <span style={{ opacity: 0.85 }}>Live data:</span> stale
                   </>
                 ) : null}
               </>
@@ -402,58 +433,52 @@ export default function Dashboard() {
       </div>
 
       <div className="panel card">
-        <div className="cardLabel">Температура</div>
-        <div className="cardValue">{fmt(latest?.temp_c ?? 0)}°C</div>
+        <div className="cardLabel">Temperature</div>
+        <div className="cardValue">{displayTemp == null ? "-" : `${fmt(displayTemp)} C`}</div>
       </div>
 
       <div className="panel card">
-        <div className="cardLabel">Ток</div>
-        <div className="cardValue">{fmt(latest?.amps ?? 0)} A</div>
+        <div className="cardLabel">Current</div>
+        <div className="cardValue">{fmt(displayAmps)} A</div>
       </div>
 
       <div className="panel card">
-        <div className="cardLabel">Вибрация</div>
-        <div className="cardValue">{Math.round(latest?.vibration ?? 0)}</div>
+        <div className="cardLabel">Vibration</div>
+        <div className="cardValue">{Math.round(displayVibration)}</div>
       </div>
 
       <div className="panel card">
-        <div className="cardLabel">PWM (Set)</div>
-        <div className="row" style={{ alignItems: "baseline" }}>
-          <div className="cardValue" style={{ marginTop: 8 }}>
-            {desiredPwm}
+        <div className="cardLabel">PWM (Out)</div>
+        <div className="cardValue">{outPwm}</div>
+        <div className="row" style={{ marginTop: 8, alignItems: "center", justifyContent: "space-between" }}>
+          <div className="reasons" style={{ margin: 0 }}>
+            <span style={{ opacity: 0.85 }}>Set:</span> {desiredPwm}
+            {deadzoneActive ? (
+              <>
+                <br />
+                <span style={{ opacity: 0.85 }}>Note:</span> below {PWM_MIN_SPIN} the motor may not spin (Out=0)
+              </>
+            ) : null}
           </div>
           <div className="btnGroup" aria-label="PWM controls">
-            <button
-              className="btn btnSmall"
-              disabled={controlBusy}
-              onClick={() => sendControl("pwm_down")}
-              title="PWM -10"
-            >
+            <button className="btn btnSmall" disabled={controlBusy} onClick={() => sendControl("pwm_down")} title="PWM -10">
               -
             </button>
-            <button
-              className="btn btnSmall"
-              disabled={controlBusy}
-              onClick={() => sendControl("pwm_up")}
-              title="PWM +10"
-            >
+            <button className="btn btnSmall" disabled={controlBusy} onClick={() => sendControl("pwm_up")} title="PWM +10">
               +
             </button>
           </div>
-        </div>
-        <div className="reasons" style={{ marginTop: 8 }}>
-          <span style={{ opacity: 0.85 }}>Out PWM:</span> {latest?.pwm ?? 0}
         </div>
       </div>
 
       <div className="panel card">
         <div className="cardLabel">Pulses</div>
-        <div className="cardValue">{latest?.pulses ?? 0}</div>
+        <div className="cardValue">{displayPulses}</div>
       </div>
 
       <div className="panel card">
         <div className="cardLabel">Pulse rate</div>
-        <div className="cardValue">{fmt(pulseRate, 1)} /s</div>
+        <div className="cardValue">{fmt(displayPulseRate, 1)} /s</div>
       </div>
 
       <div className="panel card">
@@ -523,7 +548,7 @@ export default function Dashboard() {
 
       <div className="panel chart">
         <div className="row" style={{ marginBottom: 10 }}>
-          <div className="cardLabel">PWM + Вибрация (последние точки)</div>
+          <div className="cardLabel">PWM + Vibration (recent points)</div>
           <div className="pill">
             <span className="dot" style={{ background: color }} />
             Risk score: {fmt(latest?.risk.score ?? 0, 2)}
@@ -560,7 +585,7 @@ export default function Dashboard() {
               tick={{ fill: "rgba(230,237,245,0.65)", fontSize: 11 }}
               tickFormatter={(v) => Math.round(Number(v))}
               label={{
-                value: "PWM (0–255)",
+                value: "PWM (0-255)",
                 angle: 90,
                 position: "insideRight",
                 fill: "rgba(230,237,245,0.55)"
@@ -610,7 +635,7 @@ export default function Dashboard() {
 
       <div className="panel chart">
         <div className="row" style={{ marginBottom: 10 }}>
-          <div className="cardLabel">Temp + Amps + Health (последние точки)</div>
+          <div className="cardLabel">Temp + Amps + Health (recent points)</div>
           <div className="pill">
             <span className="dot" style={{ background: wsStatus === "connected" ? "var(--good)" : "var(--bad)" }} />
             WS: {wsStatus}
@@ -633,7 +658,7 @@ export default function Dashboard() {
               domain={["dataMin - 2", "dataMax + 2"]}
               tick={{ fill: "rgba(230,237,245,0.65)", fontSize: 11 }}
               label={{
-                value: "Temp (°C)",
+                value: "Temp (C)",
                 angle: -90,
                 position: "insideLeft",
                 fill: "rgba(230,237,245,0.55)"
@@ -669,7 +694,7 @@ export default function Dashboard() {
               }
               formatter={(value, name) => {
                 if (typeof value !== "number") return [value, name];
-                if (name === "Temp") return [`${fmt(value, 1)} °C`, "Temp"];
+                if (name === "Temp") return [`${fmt(value, 1)} C`, "Temp"];
                 if (name === "Amps") return [`${fmt(value, 2)} A`, "Amps"];
                 if (name === "Health") return [`${fmt(value, 0)} %`, "Health"];
                 return [value, name];
@@ -707,21 +732,46 @@ export default function Dashboard() {
             <div className="kvVal">
               {health ? (
                 <>
-                  file: {health.nasa_baseline_file_exists ? "yes" : "no"} · active:{" "}
+                  file: {health.nasa_baseline_file_exists ? "yes" : "no"} | active:{" "}
                   {health.nasa_baseline_active ? "yes" : "no"}
                 </>
               ) : (
-                "—"
+                "-"
               )}
             </div>
           </div>
           <div className="kvItem">
             <div className="kvKey">Z-score max</div>
-            <div className="kvVal">{baselineZ == null ? "—" : fmt(baselineZ, 2)}</div>
+            <div className="kvVal">{baselineZ == null ? "-" : fmt(baselineZ, 2)}</div>
+          </div>
+          
+          <div className="kvItem">
+            <div className="kvKey">ML anomaly score</div>
+            <div className="kvVal">{mlScore == null ? "-" : fmt(mlScore, 2)}</div>
+          </div>
+          <div className="kvItem">
+            <div className="kvKey">NASA vib thresholds</div>
+            <div className="kvVal">
+              {health?.nasa_vibration?.warn_raw != null && health?.nasa_vibration?.crit_raw != null ? (
+                <>
+                  warn~{Math.round(health.nasa_vibration.warn_raw)} / crit~{Math.round(health.nasa_vibration.crit_raw)} (z{" "}
+                  {fmt(health.nasa_vibration.warn_z, 1)}/{fmt(health.nasa_vibration.crit_z, 1)}, scale {health.nasa_vibration.scale})
+                </>
+              ) : (
+                "-"
+              )}
+            </div>
+          </div>
+          <div className="kvItem">
+            <div className="kvKey">ML models</div>
+            <div className="kvVal">
+              anomaly: {health?.ml_anomaly_file_exists ? "file" : "none"} / {health?.ml_anomaly_active ? "active" : "off"} |
+              RUL: {health?.nasa_rul_ml_file_exists ? "file" : "none"} / {health?.nasa_rul_ml_active ? "active" : "off"}
+            </div>
           </div>
           <div className="kvItem">
             <div className="kvKey">DB</div>
-            <div className="kvVal">{health ? health.db_kind : "—"}</div>
+            <div className="kvVal">{health ? health.db_kind : "-"}</div>
           </div>
         </div>
 
@@ -729,7 +779,7 @@ export default function Dashboard() {
           <div style={{ flex: 1 }}>
             <div className="miniTitle">Recommendations</div>
             <ul className="list">
-              {(recommendations.length ? recommendations : ["—"]).map((x, i) => (
+              {(recommendations.length ? recommendations : ["-"]).map((x, i) => (
                 <li key={`${x}-${i}`}>{x}</li>
               ))}
             </ul>
@@ -737,7 +787,7 @@ export default function Dashboard() {
           <div style={{ flex: 1 }}>
             <div className="miniTitle">Why (signals)</div>
             <ul className="list">
-              {((latest?.risk.reasons ?? []).length ? (latest?.risk.reasons ?? []) : ["—"]).map((x, i) => (
+              {((latest?.risk.reasons ?? []).length ? (latest?.risk.reasons ?? []) : ["-"]).map((x, i) => (
                 <li key={`${x}-${i}`}>{x}</li>
               ))}
             </ul>
@@ -747,3 +797,5 @@ export default function Dashboard() {
     </div>
   );
 }
+
+

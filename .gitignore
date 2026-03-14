@@ -18,8 +18,8 @@ out/
 # Data
 *.db
 backend/data/
+*.joblib
 
 # OS
 Thumbs.db
 Desktop.ini
-
